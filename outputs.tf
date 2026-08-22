@@ -52,3 +52,42 @@ output "schema_discoverer_ids" {
   description = "Discoverer identifiers, keyed by the bus whose traffic they inspect."
   value       = { for name, discoverer in aws_schemas_discoverer.this : name => discoverer.id }
 }
+
+output "event_rule_names" {
+  description = "Created rule names, keyed by the unprefixed rule key."
+  value       = { for key, rule in aws_cloudwatch_event_rule.this : key => rule.name }
+}
+
+output "event_rule_arns" {
+  description = "Created rule ARNs, keyed by the unprefixed rule key. Target resource policies scope to these."
+  value       = { for key, rule in aws_cloudwatch_event_rule.this : key => rule.arn }
+}
+
+output "event_rule_target_ids" {
+  description = "Target identifiers attached to each rule, keyed by rule key."
+  value = {
+    for rule_key in keys(var.event_rules) : rule_key => sort([
+      for target_key, target in local.rule_targets : target.target_key if target.rule_key == rule_key
+    ])
+  }
+}
+
+output "rule_dead_letter_queue_arns" {
+  description = "Managed undeliverable-event queue ARNs, keyed by the rule that owns each one."
+  value       = local.managed_dlq_arns
+}
+
+output "rule_dead_letter_queue_urls" {
+  description = "Managed undeliverable-event queue URLs, keyed by rule key, for draining or redriving during an incident."
+  value       = { for key, queue in aws_sqs_queue.rule_dlq : key => queue.url }
+}
+
+output "targets_without_dead_letter_queue" {
+  description = "Rule/target pairs with nowhere to send a failed delivery. Empty unless managed queues are disabled without an explicit replacement."
+  value       = local.targets_without_dead_letter
+}
+
+output "step_functions_invocation_role_arn" {
+  description = "Role EventBridge assumes to start state machine targets, whether created here or supplied. Null when no state machine target is declared."
+  value       = local.states_role_arn
+}
