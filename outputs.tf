@@ -91,3 +91,38 @@ output "step_functions_invocation_role_arn" {
   description = "Role EventBridge assumes to start state machine targets, whether created here or supplied. Null when no state machine target is declared."
   value       = local.states_role_arn
 }
+
+output "pipe_names" {
+  description = "Created pipe names, keyed by the unprefixed pipe key."
+  value       = { for key, pipe in aws_pipes_pipe.this : key => pipe.name }
+}
+
+output "pipe_arns" {
+  description = "Created pipe ARNs, keyed by the unprefixed pipe key."
+  value       = { for key, pipe in aws_pipes_pipe.this : key => pipe.arn }
+}
+
+output "pipe_desired_states" {
+  description = "Whether each pipe is set to run or stay stopped, so a review can see at a glance which connectors are actually draining a queue."
+  value       = { for key, pipe in aws_pipes_pipe.this : key => pipe.desired_state }
+}
+
+output "pipe_source_queue_arns" {
+  description = "Source queue each pipe consumes, keyed by pipe key. Confirm every one of these carries a redrive policy: a pipe has no dead-letter configuration of its own."
+  value       = { for key, pipe in var.pipes : key => pipe.source_queue_arn }
+}
+
+output "pipe_log_group_names" {
+  description = "Execution log group per pipe, keyed by pipe key. Absent for a pipe with logging turned off."
+  value       = { for key, group in aws_cloudwatch_log_group.pipe : key => group.name }
+}
+
+output "pipe_role_arn" {
+  description = "Role the pipes run as, whether created here or supplied. Null when no pipe is declared."
+  value       = local.pipes_role_arn
+}
+
+output "pipes_with_unfiltered_source" {
+  description = "Pipes carrying every message their source queue receives. Empty unless a pipe deliberately declares no filter patterns."
+  value       = sort([for key, pipe in var.pipes : key if length(pipe.filter_patterns) == 0])
+}

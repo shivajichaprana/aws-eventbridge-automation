@@ -123,6 +123,39 @@ data "aws_iam_policy_document" "events_key" {
       values   = [data.aws_caller_identity.current.account_id]
     }
   }
+
+  # Pipe execution logs are encrypted with this same key unless a separate one is supplied,
+  # so CloudWatch Logs needs use of it. The encryption context pins the grant to log groups
+  # in this account and region, and the statement is omitted entirely when no pipe logs.
+  dynamic "statement" {
+    for_each = local.grant_logs_key_use ? toset(["enabled"]) : toset([])
+
+    content {
+      sid    = "AllowCloudWatchLogsToUseTheKey"
+      effect = "Allow"
+
+      principals {
+        type        = "Service"
+        identifiers = ["logs.${var.aws_region}.amazonaws.com"]
+      }
+
+      actions = [
+        "kms:Encrypt",
+        "kms:Decrypt",
+        "kms:ReEncrypt*",
+        "kms:GenerateDataKey*",
+        "kms:Describe*",
+      ]
+
+      resources = ["*"]
+
+      condition {
+        test     = "ArnLike"
+        variable = "kms:EncryptionContext:aws:logs:arn"
+        values   = ["arn:${data.aws_partition.current.partition}:logs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:log-group:*"]
+      }
+    }
+  }
 }
 
 resource "aws_kms_key" "events" {

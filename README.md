@@ -20,6 +20,9 @@ a consumer is a change here rather than a change inside the producing service.
 | Pattern-matched routing | Rules that filter a bus and fan out to typed destinations |
 | Typed targets | Lambda, SQS, and Step Functions destinations, each authorized correctly |
 | Undeliverable-event capture | A dead-letter queue per rule, scoped so its contents are unambiguous |
+| Queue-to-event bridging | Pipes that carry a queue into the backbone, filtering and enriching on the way |
+| Synchronous enrichment | A function or express workflow that adds context before delivery |
+| Execution logging | Per-pipe logs showing what was filtered, enriched, and rejected |
 
 ## Why separate buses
 
@@ -42,6 +45,7 @@ about for one class of traffic:
 | `variables.tf` | Input surface, validated at plan time |
 | `event-bus.tf` | Custom buses, archives, encryption key, schema registry and discovery |
 | `rules.tf` | Pattern rules, typed targets, target authorization, dead-letter queues |
+| `pipes.tf` | Queue-sourced pipes, filtering, enrichment, and the one role they run as |
 | `outputs.tf` | Bus, archive, key, and schema identifiers for downstream configuration |
 | `schemas/` | Published event contracts, one OpenAPI 3 document per event type |
 
@@ -170,6 +174,93 @@ The queue policy admits exactly one rule, so the contents of a dead-letter queue
 need to be attributed. Any target left with nowhere to send a failure is listed in the
 `targets_without_dead_letter_queue` output rather than being quietly accepted.
 
+## Pipes
+
+A rule fans one event out to destinations that never learn about each other. A pipe does
+the opposite: it carries a single stream from one queue to one destination, and can filter
+and enrich it on the way. Reach for a pipe when a queue needs to become part of the
+backbone -- a legacy producer that only knows how to write to SQS, a buffer that has to be
+drained in order, or a stream that needs a lookup before anyone can act on it.
+
+```hcl
+pipes = {
+  "orders-to-core" = {
+    source_queue_arn = "arn:aws:sqs:us-east-1:123456789012:legacy-order-intake"
+    description      = "Lifts orders from the legacy intake queue onto the backbone."
+
+    batch_size                         = 10
+    maximum_batching_window_in_seconds = 5
+
+    # Matched against the SQS envelope, so the payload sits under body.
+    filter_patterns = [
+      jsonencode({ body = { status = ["PLACED"] } }),
+    ]
+
+    # Whatever this returns replaces the payload. Returning nothing drops the message.
+    enrichment = {
+      type = "lambda"
+      arn  = "arn:aws:lambda:us-east-1:123456789012:function:resolve-customer"
+    }
+
+    target = {
+      type        = "bus"
+      bus         = "platform-core"
+      source      = "com.example.orders"
+      detail_type = "Order Placed"
+    }
+  }
+
+  "settlements-to-ledger" = {
+    source_queue_arn = "arn:aws:sqs:us-east-1:123456789012:settlement-feed"
+    desired_state    = "STOPPED"
+
+    target = {
+      type = "sfn"
+      arn  = "arn:aws:states:us-east-1:123456789012:stateMachine:post-settlement"
+    }
+  }
+}
+```
+
+### How a pipe differs from a rule
+
+| | Rule | Pipe |
+|---|---|---|
+| Direction | EventBridge pushes to targets | The pipe polls its source |
+| Shape | One source bus, many targets | One source queue, one destination |
+| Authorization | Per target type: resource policy or assumed role | One role does everything |
+| Backpressure | None; a slow target is retried then dropped | Work stays in the queue |
+| Enrichment | Not available | A synchronous call between source and destination |
+| Failure path | A dead-letter queue per rule | The source queue's own redrive policy |
+
+### Two things that catch people out
+
+**A filter is not an event pattern.** The message arrives wrapped in an SQS envelope, so a
+pattern copied from a rule -- one keyed on `source`, `detail-type`, or `detail` -- matches
+nothing at all, and every message is silently discarded. Filter on `body` instead. The
+input surface rejects those three field names rather than letting a pipe drain a queue into
+nowhere.
+
+**A pipe has no dead-letter queue.** A pipe that cannot deliver simply does not delete the
+message, so it returns to the source queue when the visibility timeout lapses. That makes
+the *source queue's* `maxReceiveCount` the real failure path, and a source queue with no
+redrive policy will retry a poison message forever. This configuration does not own the
+source queue, so confirm the redrive policy on every ARN listed in the
+`pipe_source_queue_arns` output.
+
+### Rolling one out safely
+
+A pipe begins consuming the moment it is created. Over a queue that already holds traffic,
+ship it with `desired_state = "STOPPED"`, confirm the destination and the filter against the
+execution log, then flip it to `RUNNING`. The `pipe_desired_states` output shows which
+connectors are live.
+
+Enrichment sharpens the same point. A Lambda enrichment is invoked synchronously and its
+return value *replaces* the payload, so an enrichment that returns an empty response stops
+the message there -- useful as a late filter for decisions a pattern cannot make, and easy
+to mistake for lost data if it is not deliberate. A Step Functions enrichment must be an
+EXPRESS workflow, because a Standard one cannot be called synchronously.
+
 ## Event contracts
 
 Files under `schemas/` are the source of truth for what a producer promises to emit. Each
@@ -192,5 +283,8 @@ event flowing without a published contract is visible rather than invisible.
   both the bus and its archive use it.
 - **Authorize precisely.** Every delivery grant names the one rule it exists for, and
   every invocation role names the exact destinations it may reach.
+- **Make the live surface visible.** A connector that drains a queue, a target with nowhere
+  to send a failure, and a pipe carrying every message unfiltered are each reported as an
+  output rather than left to be discovered during an incident.
 - **Placeholders only.** Account identifiers, ARNs, and domain names in this repository are
   documentation examples.
