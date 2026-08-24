@@ -785,3 +785,438 @@ variable "pipe_log_kms_key_arn" {
     error_message = "pipe_log_kms_key_arn must be a KMS key ARN when set."
   }
 }
+
+variable "schedule_groups" {
+  description = "Schedule groups to create, keyed by an unprefixed group name. A group is the unit schedules are organised, tagged, and monitored by, so splitting by owning team or by blast radius is more useful than splitting by cadence."
+  type        = set(string)
+  default     = ["default"]
+
+  validation {
+    condition     = length(var.schedule_groups) > 0
+    error_message = "At least one schedule group must be declared: every schedule belongs to a group."
+  }
+
+  validation {
+    condition = alltrue([
+      for name in var.schedule_groups : can(regex("^[A-Za-z0-9._-]{1,48}$", name))
+    ])
+    error_message = "Schedule group keys may contain only letters, digits, dots, underscores, and hyphens, and must be at most 48 characters."
+  }
+}
+
+variable "schedules" {
+  description = "Clock-driven invocations, keyed by an unprefixed schedule name. Each schedule fires one target on a recurring or one-time expression. Ships empty because every target ARN names a resource owned outside this configuration; see the README for a worked example."
+  type = map(object({
+    schedule_expression          = string
+    schedule_expression_timezone = optional(string)
+    description                  = optional(string)
+    group                        = optional(string, "default")
+    state                        = optional(string, "ENABLED")
+    start_date                   = optional(string)
+    end_date                     = optional(string)
+
+    # Null means every invocation lands on the second the expression names. A number
+    # spreads invocations across that many minutes, which is how a fleet of schedules
+    # avoids arriving at a shared downstream all at once.
+    flexible_time_window_minutes = optional(number)
+
+    # Keys protecting the destination, where those differ from the key encrypting the
+    # schedule payload. The schedule invokes its target as itself, so it needs key use
+    # directly.
+    additional_kms_key_arns = optional(list(string), [])
+
+    target = object({
+      type             = string
+      arn              = optional(string)
+      bus              = optional(string)
+      input            = optional(string)
+      message_group_id = optional(string)
+      detail_type      = optional(string)
+      source           = optional(string)
+
+      dead_letter_queue_arn        = optional(string)
+      maximum_event_age_in_seconds = optional(number)
+      maximum_retry_attempts       = optional(number)
+    })
+  }))
+
+  default = {}
+
+  validation {
+    condition = alltrue([
+      for name in keys(var.schedules) : can(regex("^[A-Za-z0-9._-]{1,64}$", name))
+    ])
+    error_message = "Schedule keys may contain only letters, digits, dots, underscores, and hyphens, and must be at most 64 characters."
+  }
+
+  validation {
+    condition = alltrue([
+      for schedule in values(var.schedules) : can(regex(
+        "^(rate\\([0-9]+ (minute|minutes|hour|hours|day|days)\\)|cron\\(.+\\)|at\\([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\))$",
+        schedule.schedule_expression
+      ))
+    ])
+    error_message = "schedule_expression must be a rate(), cron(), or at() expression. A one-time run uses at(YYYY-MM-DDTHH:MM:SS) with no trailing Z: the zone comes from schedule_expression_timezone."
+  }
+
+  validation {
+    condition = alltrue([
+      for schedule in values(var.schedules) :
+      schedule.schedule_expression_timezone == null ? true : can(regex("^([A-Za-z]+/[A-Za-z0-9_+-]+|UTC)$", schedule.schedule_expression_timezone))
+    ])
+    error_message = "schedule_expression_timezone must be an IANA zone name such as Europe/Amsterdam, or UTC. Naming the zone rather than baking an offset into the expression is what keeps a schedule correct across a daylight-saving change."
+  }
+
+  validation {
+    condition = alltrue([
+      for schedule in values(var.schedules) : contains(["ENABLED", "DISABLED"], schedule.state)
+    ])
+    error_message = "Schedule state must be ENABLED or DISABLED."
+  }
+
+  validation {
+    condition = alltrue([
+      for schedule in values(var.schedules) : can(regex("^[A-Za-z0-9._-]{1,48}$", schedule.group))
+    ])
+    error_message = "A schedule group reference may contain only letters, digits, dots, underscores, and hyphens, and must be at most 48 characters."
+  }
+
+  validation {
+    condition = alltrue([
+      for schedule in values(var.schedules) :
+      schedule.start_date == null ? true : can(regex("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$", schedule.start_date))
+    ])
+    error_message = "start_date must be a UTC timestamp of the form YYYY-MM-DDTHH:MM:SSZ when set."
+  }
+
+  validation {
+    condition = alltrue([
+      for schedule in values(var.schedules) :
+      schedule.end_date == null ? true : can(regex("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$", schedule.end_date))
+    ])
+    error_message = "end_date must be a UTC timestamp of the form YYYY-MM-DDTHH:MM:SSZ when set."
+  }
+
+  validation {
+    condition = alltrue([
+      for schedule in values(var.schedules) :
+      startswith(schedule.schedule_expression, "at(") ? (schedule.start_date == null && schedule.end_date == null) : true
+    ])
+    error_message = "start_date and end_date bound a recurring schedule and are not accepted on a one-time at() expression, which already names the moment it runs."
+  }
+
+  validation {
+    condition = alltrue([
+      for schedule in values(var.schedules) :
+      schedule.flexible_time_window_minutes == null ? true : (schedule.flexible_time_window_minutes >= 1 && schedule.flexible_time_window_minutes <= 1440)
+    ])
+    error_message = "flexible_time_window_minutes must be between 1 and 1440 when set. Leave it null to fire on the exact second the expression names."
+  }
+
+  validation {
+    condition = alltrue([
+      for schedule in values(var.schedules) : contains(["lambda", "sqs", "sfn", "bus"], schedule.target.type)
+    ])
+    error_message = "Schedule target type must be one of lambda, sqs, sfn, or bus."
+  }
+
+  validation {
+    condition = alltrue([
+      for schedule in values(var.schedules) :
+      schedule.target.type == "bus" ? (schedule.target.bus != null && schedule.target.arn == null) : (schedule.target.arn != null && schedule.target.bus == null)
+    ])
+    error_message = "A bus target names a declared bus key in bus and leaves arn unset; every other target type names arn and leaves bus unset."
+  }
+
+  validation {
+    condition = alltrue([
+      for schedule in values(var.schedules) :
+      schedule.target.type != "lambda" ? true : can(regex("^arn:aws[a-zA-Z-]*:lambda:[a-z0-9-]+:[0-9]{12}:function:[A-Za-z0-9_-]+(:[A-Za-z0-9_$-]+)?$", schedule.target.arn))
+    ])
+    error_message = "A lambda schedule target must name a Lambda function ARN."
+  }
+
+  validation {
+    condition = alltrue([
+      for schedule in values(var.schedules) :
+      schedule.target.type != "sqs" ? true : can(regex("^arn:aws[a-zA-Z-]*:sqs:[a-z0-9-]+:[0-9]{12}:[A-Za-z0-9_-]+(\\.fifo)?$", schedule.target.arn))
+    ])
+    error_message = "An sqs schedule target must name an SQS queue ARN."
+  }
+
+  validation {
+    condition = alltrue([
+      for schedule in values(var.schedules) :
+      schedule.target.type != "sfn" ? true : can(regex("^arn:aws[a-zA-Z-]*:states:[a-z0-9-]+:[0-9]{12}:stateMachine:[A-Za-z0-9_-]+$", schedule.target.arn))
+    ])
+    error_message = "An sfn schedule target must name a state machine ARN. An activity or an execution ARN is not a valid destination."
+  }
+
+  validation {
+    condition = alltrue([
+      for schedule in values(var.schedules) :
+      schedule.target.message_group_id == null ? true : schedule.target.type == "sqs"
+    ])
+    error_message = "message_group_id applies only to an sqs schedule target."
+  }
+
+  validation {
+    condition = alltrue([
+      for schedule in values(var.schedules) :
+      schedule.target.type != "sqs" ? true : (
+        endswith(schedule.target.arn == null ? "" : schedule.target.arn, ".fifo") == (schedule.target.message_group_id != null)
+      )
+    ])
+    error_message = "A FIFO queue target requires message_group_id, and a standard queue target must not declare one."
+  }
+
+  validation {
+    condition = alltrue([
+      for schedule in values(var.schedules) :
+      schedule.target.type == "bus" ? (schedule.target.detail_type != null && schedule.target.source != null) : (schedule.target.detail_type == null && schedule.target.source == null)
+    ])
+    error_message = "A bus schedule target must declare both detail_type and source, because it publishes a new event rather than forwarding one; no other target type accepts them."
+  }
+
+  validation {
+    condition = alltrue([
+      for schedule in values(var.schedules) :
+      schedule.target.type != "bus" ? true : (schedule.target.input == null ? true : can(jsondecode(schedule.target.input)))
+    ])
+    error_message = "The input of a bus schedule target becomes the detail of the published event, so it must be a JSON document."
+  }
+
+  validation {
+    condition = alltrue([
+      for schedule in values(var.schedules) :
+      schedule.target.dead_letter_queue_arn == null ? true : can(regex("^arn:aws[a-zA-Z-]*:sqs:[a-z0-9-]+:[0-9]{12}:[A-Za-z0-9_-]+(\\.fifo)?$", schedule.target.dead_letter_queue_arn))
+    ])
+    error_message = "A schedule dead_letter_queue_arn must be an SQS queue ARN when set."
+  }
+
+  validation {
+    condition = alltrue([
+      for schedule in values(var.schedules) :
+      schedule.target.maximum_event_age_in_seconds == null ? true : (schedule.target.maximum_event_age_in_seconds >= 60 && schedule.target.maximum_event_age_in_seconds <= 86400)
+    ])
+    error_message = "A schedule target maximum_event_age_in_seconds must be between 60 and 86400 when set."
+  }
+
+  validation {
+    condition = alltrue([
+      for schedule in values(var.schedules) :
+      schedule.target.maximum_retry_attempts == null ? true : (schedule.target.maximum_retry_attempts >= 0 && schedule.target.maximum_retry_attempts <= 185)
+    ])
+    error_message = "A schedule target maximum_retry_attempts must be between 0 and 185 when set."
+  }
+
+  validation {
+    condition = alltrue([
+      for schedule in values(var.schedules) : alltrue([
+        for key_arn in schedule.additional_kms_key_arns :
+        can(regex("^arn:aws[a-zA-Z-]*:kms:[a-z0-9-]+:[0-9]{12}:key/", key_arn))
+      ])
+    ])
+    error_message = "Every entry in additional_kms_key_arns must be a KMS key ARN."
+  }
+}
+
+variable "schedule_role_arn" {
+  description = "ARN of an existing role the schedules should assume. Leave null to let this configuration create one scoped to exactly the declared targets."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.schedule_role_arn == null ? true : can(regex("^arn:aws[a-zA-Z-]*:iam::[0-9]{12}:role/", var.schedule_role_arn))
+    error_message = "schedule_role_arn must be an IAM role ARN when set."
+  }
+}
+
+variable "schedule_kms_key_arn" {
+  description = "Key encrypting the stored target payload of every schedule. Leave null to use the bus key when one exists, so a schedule carrying a request body is protected the same way an event carrying one is."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.schedule_kms_key_arn == null ? true : can(regex("^arn:aws[a-zA-Z-]*:kms:[a-z0-9-]+:[0-9]{12}:key/", var.schedule_kms_key_arn))
+    error_message = "schedule_kms_key_arn must be a KMS key ARN when set."
+  }
+}
+
+variable "cross_account_access" {
+  description = "Who outside this account may publish onto each bus, keyed by the bus key they are being granted access to. Absent an entry, a bus accepts events only from its own account."
+  type = map(object({
+    account_ids     = optional(list(string), [])
+    organization_id = optional(string)
+    principal_arns  = optional(list(string), [])
+
+    # Narrow the grant to the events a producer is actually expected to publish. An
+    # unconstrained grant lets a partner account put anything at all onto the bus,
+    # including something that matches a rule it was never meant to trigger.
+    allowed_sources      = optional(list(string), [])
+    allowed_detail_types = optional(list(string), [])
+
+    allow_rule_management = optional(bool, false)
+  }))
+
+  default = {}
+
+  validation {
+    condition = alltrue([
+      for cfg in values(var.cross_account_access) :
+      length(cfg.account_ids) > 0 || cfg.organization_id != null || length(cfg.principal_arns) > 0
+    ])
+    error_message = "Every cross_account_access entry must name at least one of account_ids, organization_id, or principal_arns. An entry that names nobody would produce a bus policy with no principal."
+  }
+
+  validation {
+    condition = alltrue([
+      for cfg in values(var.cross_account_access) : alltrue([
+        for account_id in cfg.account_ids : can(regex("^[0-9]{12}$", account_id))
+      ])
+    ])
+    error_message = "Every entry in account_ids must be a 12-digit AWS account id."
+  }
+
+  validation {
+    condition = alltrue([
+      for cfg in values(var.cross_account_access) :
+      cfg.organization_id == null ? true : can(regex("^o-[a-z0-9]{10,32}$", cfg.organization_id))
+    ])
+    error_message = "organization_id must be an AWS Organizations identifier of the form o-xxxxxxxxxx when set."
+  }
+
+  validation {
+    condition = alltrue([
+      for cfg in values(var.cross_account_access) : alltrue([
+        for principal_arn in cfg.principal_arns :
+        can(regex("^arn:aws[a-zA-Z-]*:iam::[0-9]{12}:(root|role/.+|user/.+)$", principal_arn))
+      ])
+    ])
+    error_message = "Every entry in principal_arns must be an IAM root, role, or user ARN."
+  }
+
+  validation {
+    condition = alltrue([
+      for cfg in values(var.cross_account_access) : alltrue([
+        for source in cfg.allowed_sources : length(source) > 0
+      ])
+    ])
+    error_message = "allowed_sources may not contain an empty string: an empty value would match nothing and silently deny the grant it appears in."
+  }
+
+  validation {
+    condition = alltrue([
+      for cfg in values(var.cross_account_access) : alltrue([
+        for detail_type in cfg.allowed_detail_types : length(detail_type) > 0
+      ])
+    ])
+    error_message = "allowed_detail_types may not contain an empty string."
+  }
+
+  validation {
+    condition = alltrue([
+      for cfg in values(var.cross_account_access) :
+      cfg.allow_rule_management ? (length(cfg.account_ids) > 0 || length(cfg.principal_arns) > 0) : true
+    ])
+    error_message = "allow_rule_management may not be granted to a whole organization. Creating rules on someone else's bus is a far larger grant than publishing to it, so the accounts allowed to do it must be named explicitly."
+  }
+}
+
+variable "cross_account_forwarding" {
+  description = "Rules that copy matching events from a local bus onto a bus in another account or region, keyed by an unprefixed rule name. The receiving bus must separately grant this account permission to publish to it."
+  type = map(object({
+    bus                  = string
+    event_pattern        = string
+    destination_bus_arns = list(string)
+    description          = optional(string)
+    state                = optional(string, "ENABLED")
+
+    dead_letter_queue_arn        = optional(string)
+    maximum_event_age_in_seconds = optional(number)
+    maximum_retry_attempts       = optional(number)
+  }))
+
+  default = {}
+
+  validation {
+    condition = alltrue([
+      for name in keys(var.cross_account_forwarding) : can(regex("^[A-Za-z0-9._-]{1,48}$", name))
+    ])
+    error_message = "Forwarding keys may contain only letters, digits, dots, underscores, and hyphens, and must be at most 48 characters so the prefixed rule name stays within the 64-character limit."
+  }
+
+  validation {
+    condition = alltrue([
+      for fwd in values(var.cross_account_forwarding) : can(jsondecode(fwd.event_pattern))
+    ])
+    error_message = "Every forwarding rule must declare event_pattern as a JSON document. Forwarding everything a bus receives is rarely intended; match the events the other account actually needs."
+  }
+
+  validation {
+    condition = alltrue([
+      for fwd in values(var.cross_account_forwarding) : length(fwd.destination_bus_arns) > 0
+    ])
+    error_message = "Every forwarding rule must name at least one destination bus."
+  }
+
+  validation {
+    condition = alltrue([
+      for fwd in values(var.cross_account_forwarding) : alltrue([
+        for arn in fwd.destination_bus_arns :
+        can(regex("^arn:aws[a-zA-Z-]*:events:[a-z0-9-]+:[0-9]{12}:event-bus/[A-Za-z0-9._-]+$", arn))
+      ])
+    ])
+    error_message = "Every destination must be an event bus ARN. A rule cannot forward directly to another account's rule or target."
+  }
+
+  validation {
+    condition = alltrue([
+      for fwd in values(var.cross_account_forwarding) :
+      length(distinct(fwd.destination_bus_arns)) == length(fwd.destination_bus_arns)
+    ])
+    error_message = "A forwarding rule may not name the same destination bus twice: the duplicate would collide on the generated target identifier."
+  }
+
+  validation {
+    condition = alltrue([
+      for fwd in values(var.cross_account_forwarding) : contains(["ENABLED", "DISABLED"], fwd.state)
+    ])
+    error_message = "Forwarding rule state must be ENABLED or DISABLED. Ship a new cross-account route DISABLED, confirm the receiving policy, then enable it."
+  }
+
+  validation {
+    condition = alltrue([
+      for fwd in values(var.cross_account_forwarding) :
+      fwd.dead_letter_queue_arn == null ? true : can(regex("^arn:aws[a-zA-Z-]*:sqs:[a-z0-9-]+:[0-9]{12}:[A-Za-z0-9_-]+$", fwd.dead_letter_queue_arn))
+    ])
+    error_message = "A forwarding dead_letter_queue_arn must be a standard SQS queue ARN when set."
+  }
+
+  validation {
+    condition = alltrue([
+      for fwd in values(var.cross_account_forwarding) :
+      fwd.maximum_event_age_in_seconds == null ? true : (fwd.maximum_event_age_in_seconds >= 60 && fwd.maximum_event_age_in_seconds <= 86400)
+    ])
+    error_message = "A forwarding maximum_event_age_in_seconds must be between 60 and 86400 when set."
+  }
+
+  validation {
+    condition = alltrue([
+      for fwd in values(var.cross_account_forwarding) :
+      fwd.maximum_retry_attempts == null ? true : (fwd.maximum_retry_attempts >= 0 && fwd.maximum_retry_attempts <= 185)
+    ])
+    error_message = "A forwarding maximum_retry_attempts must be between 0 and 185 when set."
+  }
+}
+
+variable "cross_account_forwarding_role_arn" {
+  description = "ARN of an existing role EventBridge should assume to publish onto the declared destination buses. Leave null to let this configuration create one scoped to exactly those buses."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.cross_account_forwarding_role_arn == null ? true : can(regex("^arn:aws[a-zA-Z-]*:iam::[0-9]{12}:role/", var.cross_account_forwarding_role_arn))
+    error_message = "cross_account_forwarding_role_arn must be an IAM role ARN when set."
+  }
+}

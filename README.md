@@ -23,6 +23,11 @@ a consumer is a change here rather than a change inside the producing service.
 | Queue-to-event bridging | Pipes that carry a queue into the backbone, filtering and enriching on the way |
 | Synchronous enrichment | A function or express workflow that adds context before delivery |
 | Execution logging | Per-pipe logs showing what was filtered, enriched, and rejected |
+| Scheduled invocation | Recurring and one-time work on a clock, independent of any bus |
+| Timezone-aware cron | Schedules that stay correct across a daylight-saving change |
+| Invocation spreading | Flexible windows so a fleet of schedules does not arrive at once |
+| Cross-account publishing | A narrowed resource policy saying who outside the account may publish |
+| Cross-account forwarding | Rules that copy matching events onto a bus in another account or region |
 
 ## Why separate buses
 
@@ -46,6 +51,8 @@ about for one class of traffic:
 | `event-bus.tf` | Custom buses, archives, encryption key, schema registry and discovery |
 | `rules.tf` | Pattern rules, typed targets, target authorization, dead-letter queues |
 | `pipes.tf` | Queue-sourced pipes, filtering, enrichment, and the one role they run as |
+| `scheduler.tf` | Schedule groups, schedules, and the role their targets are invoked with |
+| `cross-account.tf` | Inbound publish grants and outbound forwarding to remote buses |
 | `outputs.tf` | Bus, archive, key, and schema identifiers for downstream configuration |
 | `schemas/` | Published event contracts, one OpenAPI 3 document per event type |
 
@@ -261,6 +268,131 @@ the message there -- useful as a late filter for decisions a pattern cannot make
 to mistake for lost data if it is not deliberate. A Step Functions enrichment must be an
 EXPRESS workflow, because a Standard one cannot be called synchronously.
 
+## Scheduled invocation
+
+Some work has to happen at a time rather than because something happened. EventBridge only
+accepts a schedule expression on the AWS-managed `default` bus, so a scheduled rule cannot
+live on any of the buses declared here. Schedules are their own surface instead.
+
+```hcl
+schedule_groups = ["default", "billing"]
+
+schedules = {
+  "nightly-reconciliation" = {
+    schedule_expression          = "cron(15 2 * * ? *)"
+    schedule_expression_timezone = "Europe/Amsterdam"
+    group                        = "billing"
+    flexible_time_window_minutes = 15
+
+    target = {
+      type                  = "lambda"
+      arn                   = "arn:aws:lambda:us-east-1:123456789012:function:reconcile-ledger"
+      input                 = jsonencode({ mode = "full" })
+      dead_letter_queue_arn = "arn:aws:sqs:us-east-1:123456789012:missed-invocations"
+    }
+  }
+
+  "close-period" = {
+    schedule_expression = "at(2026-10-01T03:00:00)"
+
+    target = {
+      type        = "bus"
+      bus         = "platform-core"
+      source      = "com.example.billing"
+      detail_type = "Period Close Requested"
+      input       = jsonencode({ period = "2026-09" })
+    }
+  }
+}
+```
+
+### How a schedule differs from a rule
+
+| | Rule | Schedule |
+|---|---|---|
+| Trigger | An event that already exists | A moment on a clock |
+| Bus | Reads from a declared custom bus | Belongs to no bus at all |
+| Shape | One pattern, many targets | One expression, one target |
+| Authorization | Per target type: resource policy or assumed role | One role does everything |
+| Replay | The archive holds the original event | Nothing is stored; a missed run is gone |
+| Failure path | A dead-letter queue per rule | A dead-letter queue per schedule, if declared |
+
+### Three things worth deciding deliberately
+
+**Name the timezone, do not bake in the offset.** `schedule_expression_timezone` takes an
+IANA zone such as `Europe/Amsterdam`, and a schedule written that way still runs at 02:15
+local after the clocks change. A UTC expression chosen to line up with local time silently
+drifts by an hour twice a year.
+
+**Spread the load or accept the spike.** Everything written as `cron(0 * * * ? *)` fires in
+the same second, and a downstream that would absorb the same work comfortably over ten
+minutes falls over when it arrives at once. `flexible_time_window_minutes` opts into
+spreading; leaving it unset is the right answer only when the job must run exactly on the
+hour.
+
+**Give anything that matters somewhere to fail.** A schedule retries inside its retry
+window and then stops. Without a dead-letter queue the only remaining evidence is a metric,
+so the `schedules_without_dead_letter_queue` output lists every schedule in that position:
+fine for a cache refresh, not for closing a billing period.
+
+A one-time `at()` schedule stays in place after it fires, in a completed state, so a group
+accumulates them until they are removed. `start_date` and `end_date` bound a recurring
+schedule and are rejected on a one-time one, which already names the moment it runs.
+
+## Cross-account routing
+
+Cross-account delivery is two independent halves, usually owned by two different teams.
+Almost every failure comes from doing one of them and assuming the other was done too.
+
+**Inbound** is a resource policy on the receiving bus. A bus accepts events only from its
+own account until it says otherwise, so the account that owns the bus decides who may
+publish to it:
+
+```hcl
+cross_account_access = {
+  "platform-integration" = {
+    account_ids          = ["222222222222"]
+    allowed_sources      = ["com.partner.orders"]
+    allowed_detail_types = ["Order Placed", "Order Cancelled"]
+  }
+}
+```
+
+Naming an account and stopping there lets that account put anything at all onto the bus,
+including something shaped to match a rule it was never meant to trigger.
+`allowed_sources` and `allowed_detail_types` narrow the grant to what the producer actually
+publishes. A whole organization can be trusted with `organization_id` instead, but
+`allow_rule_management` -- which lets a grantee decide where these events go next -- must
+name its accounts explicitly, and confines each one to the rules it created.
+
+**Outbound** is a rule whose target is a remote bus, plus a role EventBridge assumes to
+publish there:
+
+```hcl
+cross_account_forwarding = {
+  "orders-to-analytics" = {
+    bus                   = "platform-core"
+    event_pattern         = jsonencode({ source = ["com.example.orders"] })
+    destination_bus_arns  = ["arn:aws:events:us-east-1:333333333333:event-bus/analytics-core"]
+    dead_letter_queue_arn = "arn:aws:sqs:us-east-1:123456789012:forwarding-failures"
+  }
+}
+```
+
+Until the receiving account has done the inbound half, every delivery is refused. That
+refusal is invisible without a queue, which is why
+`cross_account_forwarding_without_dead_letter_queue` reports any route lacking one, and why
+a new route is worth shipping with `state = "DISABLED"` and enabling once the far side is
+confirmed.
+
+Two properties to design around. The receiving bus sees the event with the **sending**
+account's id in the `account` field while `source` and `detail-type` survive unchanged, so
+a consumer that needs the origin should read `account` rather than assume `source` encodes
+it. And a single hop is the pattern to aim for: forwarding an event that was itself
+forwarded is hard to reason about, and a cycle between two buses sustains itself and bills
+on every pass. A rule forwarding to a bus this configuration creates is rejected outright;
+a longer cycle is a review question rather than a machine-checkable one.
+
 ## Event contracts
 
 Files under `schemas/` are the source of truth for what a producer promises to emit. Each
@@ -286,5 +418,8 @@ event flowing without a published contract is visible rather than invisible.
 - **Make the live surface visible.** A connector that drains a queue, a target with nowhere
   to send a failure, and a pipe carrying every message unfiltered are each reported as an
   output rather than left to be discovered during an incident.
+- **One clock, one owner.** Recurring work is declared here alongside the routing it
+  triggers, so the schedule, its permissions, and its failure path are reviewed together
+  rather than living in whatever service happened to own a cron entry.
 - **Placeholders only.** Account identifiers, ARNs, and domain names in this repository are
   documentation examples.

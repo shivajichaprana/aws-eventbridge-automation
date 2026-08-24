@@ -364,10 +364,17 @@ data "aws_iam_policy_document" "event_target_states_assume" {
       values   = [data.aws_caller_identity.current.account_id]
     }
 
+    # A rule on a custom bus carries the bus name in its ARN, between the rule segment and
+    # the rule name, so both shapes are listed: the second matches every rule this
+    # configuration creates, and the first covers the default-bus form.
     condition {
       test     = "ArnLike"
       variable = "aws:SourceArn"
-      values   = ["arn:${data.aws_partition.current.partition}:events:${var.aws_region}:${data.aws_caller_identity.current.account_id}:rule/${var.name_prefix}-*"]
+
+      values = [
+        "arn:${data.aws_partition.current.partition}:events:${var.aws_region}:${data.aws_caller_identity.current.account_id}:rule/${var.name_prefix}-*",
+        "arn:${data.aws_partition.current.partition}:events:${var.aws_region}:${data.aws_caller_identity.current.account_id}:rule/*/${var.name_prefix}-*",
+      ]
     }
   }
 }

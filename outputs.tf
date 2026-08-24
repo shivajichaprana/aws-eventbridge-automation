@@ -126,3 +126,76 @@ output "pipes_with_unfiltered_source" {
   description = "Pipes carrying every message their source queue receives. Empty unless a pipe deliberately declares no filter patterns."
   value       = sort([for key, pipe in var.pipes : key if length(pipe.filter_patterns) == 0])
 }
+
+output "schedule_group_names" {
+  description = "Created schedule group names, keyed by the unprefixed group key."
+  value       = local.schedule_group_names
+}
+
+output "schedule_names" {
+  description = "Created schedule names, keyed by the unprefixed schedule key."
+  value       = { for key, schedule in aws_scheduler_schedule.this : key => schedule.name }
+}
+
+output "schedule_arns" {
+  description = "Created schedule ARNs, keyed by the unprefixed schedule key."
+  value       = { for key, schedule in aws_scheduler_schedule.this : key => schedule.arn }
+}
+
+output "schedule_states" {
+  description = "Whether each schedule is set to run, so a review can see at a glance which clocks are actually ticking."
+  value       = { for key, schedule in aws_scheduler_schedule.this : key => schedule.state }
+}
+
+output "schedule_role_arn" {
+  description = "Role the schedules run as, whether created here or supplied. Null when no schedule is declared."
+  value       = local.schedule_role_arn
+}
+
+output "schedule_kms_key_arn" {
+  description = "Key encrypting the stored target payload of every schedule, whether the bus key or one supplied for the purpose."
+  value       = local.schedule_key_arn
+}
+
+output "schedules_without_dead_letter_queue" {
+  description = "Schedules with nowhere to record an invocation that never succeeded. A missed run leaves no other trace, so anything here should be a deliberate choice."
+  value       = local.schedules_without_dead_letter
+}
+
+output "cross_account_bus_grants" {
+  description = "Who may publish onto each bus from outside this account, keyed by bus key, with the event shapes each grant is narrowed to. Empty for a bus that accepts events only from its own account."
+  value = {
+    for key, cfg in local.cross_account_buses : key => {
+      named_principals     = sort(local.cross_account_named_principals[key])
+      organization_id      = cfg.organization_id
+      allowed_sources      = sort(cfg.allowed_sources)
+      allowed_detail_types = sort(cfg.allowed_detail_types)
+      rule_management      = cfg.allow_rule_management
+    }
+  }
+}
+
+output "cross_account_forwarding_rule_names" {
+  description = "Created forwarding rule names, keyed by the unprefixed forwarding key."
+  value       = { for key, rule in aws_cloudwatch_event_rule.cross_account_forwarding : key => rule.name }
+}
+
+output "cross_account_forwarding_rule_arns" {
+  description = "Created forwarding rule ARNs, keyed by the unprefixed forwarding key."
+  value       = { for key, rule in aws_cloudwatch_event_rule.cross_account_forwarding : key => rule.arn }
+}
+
+output "cross_account_forwarding_destinations" {
+  description = "Remote buses each forwarding rule publishes to, keyed by forwarding key. Every one of these needs a matching grant in the account that owns it before delivery succeeds."
+  value       = { for key, fwd in var.cross_account_forwarding : key => sort(fwd.destination_bus_arns) }
+}
+
+output "cross_account_forwarding_role_arn" {
+  description = "Role EventBridge assumes to publish onto remote buses, whether created here or supplied. Null when no forwarding rule is declared."
+  value       = local.forwarding_role_arn
+}
+
+output "cross_account_forwarding_without_dead_letter_queue" {
+  description = "Forwarding rules with nowhere to send a delivery the receiving account refused. Cross-account delivery fails for reasons outside this account's control, so anything here fails silently."
+  value       = local.forwarding_without_dead_letter
+}

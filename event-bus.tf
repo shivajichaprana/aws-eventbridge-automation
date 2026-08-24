@@ -156,6 +156,39 @@ data "aws_iam_policy_document" "events_key" {
       }
     }
   }
+
+  # A schedule's stored target payload is encrypted with this same key unless a separate
+  # one is supplied. EventBridge Scheduler reads that payload as the role the schedule
+  # assumes rather than as a service principal, so the grant names that role. Admitting it
+  # by its predicted ARN keeps this statement dependent on inputs alone, so the key never
+  # waits on the role it is admitting.
+  dynamic "statement" {
+    for_each = local.grant_scheduler_key_use ? toset(["enabled"]) : toset([])
+
+    content {
+      sid    = "AllowScheduleExecutionRoleToUseTheKey"
+      effect = "Allow"
+
+      principals {
+        type        = "AWS"
+        identifiers = ["arn:${data.aws_partition.current.partition}:iam::${data.aws_caller_identity.current.account_id}:root"]
+      }
+
+      actions = [
+        "kms:Decrypt",
+        "kms:DescribeKey",
+        "kms:GenerateDataKey",
+      ]
+
+      resources = ["*"]
+
+      condition {
+        test     = "ArnEquals"
+        variable = "aws:PrincipalArn"
+        values   = [local.scheduler_principal_arn]
+      }
+    }
+  }
 }
 
 resource "aws_kms_key" "events" {
