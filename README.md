@@ -16,7 +16,7 @@ a consumer is a change here rather than a change inside the producing service.
 | Durable archive | Every accepted event retained for a declared window and replayable |
 | Event contracts | Published, versioned schemas so consumers code against an agreement |
 | Schema discovery | Automatic inference of what is actually flowing, to catch undeclared events |
-| Encryption at rest | Bus and archive contents encrypted with a customer managed key |
+| Encryption at rest | Bus contents encrypted with a customer managed key, rotated yearly |
 | Pattern-matched routing | Rules that filter a bus and fan out to typed destinations |
 | Typed targets | Lambda, SQS, and Step Functions destinations, each authorized correctly |
 | Undeliverable-event capture | A dead-letter queue per rule, scoped so its contents are unambiguous |
@@ -439,7 +439,8 @@ Both gates run on every push and pull request, alongside `terraform fmt`, `valid
   malformed event pattern or an impossible combination is rejected before anything is
   created.
 - **Encrypted by default.** A customer managed key is created unless one is supplied, and
-  both the bus and its archive use it.
+  every bus uses it. Archives are the one exception, and the reason is recorded where the
+  archive is declared rather than left to be discovered.
 - **Authorize precisely.** Every delivery grant names the one rule it exists for, and
   every invocation role names the exact destinations it may reach.
 - **Make the live surface visible.** A connector that drains a queue, a target with nowhere

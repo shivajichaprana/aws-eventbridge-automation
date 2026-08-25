@@ -96,11 +96,11 @@ data "aws_iam_policy_document" "events_key" {
     }
   }
 
-  # Archive and replay hold events beyond the lifetime of a single API call, so the
-  # service needs a grant rather than a one-shot decrypt. The grant is constrained to
-  # AWS resources and to this account.
+  # Replay republishes events long after the call that archived them, so the service
+  # needs a grant rather than a one-shot decrypt. The grant is constrained to AWS
+  # resources and to this account.
   statement {
-    sid    = "AllowEventBridgeToCreateGrantsForArchiveAndReplay"
+    sid    = "AllowEventBridgeToCreateGrantsForReplay"
     effect = "Allow"
 
     principals {
@@ -260,9 +260,13 @@ resource "aws_cloudwatch_event_archive" "this" {
   # decision, not a correctness one, so it is left to the caller.
   event_pattern = each.value.archive.event_pattern
 
-  # An archive over an encrypted bus must use the same key, otherwise the archive is
-  # rejected at create time rather than silently storing plaintext.
-  kms_key_identifier = local.bus_key_arn
+  # An archive cannot be given a customer managed key here: the provider gained
+  # kms_key_identifier on this resource in 6.2.0, and this configuration is pinned below
+  # that major. Archive contents are therefore encrypted with an AWS owned key while the
+  # bus itself uses the customer managed key. AWS permits the combination -- the console
+  # warns that it recommends matching keys rather than refusing -- so it is a weaker
+  # posture, not a broken one. Raising the provider ceiling is the fix, and is a change
+  # worth making deliberately rather than as a side effect.
 
   lifecycle {
     precondition {
