@@ -1,0 +1,2 @@
+# The suite runs offline against the repository's own files.
+pytest==8.3.4

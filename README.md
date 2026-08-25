@@ -55,6 +55,7 @@ about for one class of traffic:
 | `cross-account.tf` | Inbound publish grants and outbound forwarding to remote buses |
 | `outputs.tf` | Bus, archive, key, and schema identifiers for downstream configuration |
 | `schemas/` | Published event contracts, one OpenAPI 3 document per event type |
+| `tests/` | Offline checks over every event pattern and contract in the tree |
 
 ## Getting started
 
@@ -133,7 +134,7 @@ event_rules = {
     event_pattern = jsonencode({
       source        = ["com.example.payments"]
       "detail-type" = ["Payment Settled"]
-      detail        = { status = ["SETTLED"] }
+      detail        = { method = ["card", "wallet"] }
     })
 
     targets = {
@@ -403,6 +404,28 @@ cannot silently detach a contract from the events it describes.
 
 Adding a contract means adding a file. Discovery stays enabled alongside it so that an
 event flowing without a published contract is visible rather than invisible.
+
+## Validation
+
+An event pattern is the one part of this configuration that fails silently. A rule with a
+wrong pattern is created successfully, keeps its targets, reports healthy, and never
+delivers anything, because "matched nothing" and "working normally" look identical from
+outside. Terraform can confirm a pattern parses as JSON and nothing beyond that.
+
+`tests/` covers what comes after: the matching semantics that decide whether a pattern
+selects an event, the structural rules the service enforces, and a set of conventions this
+repository adds -- a pattern keys only on real envelope fields, every rule constrains
+`source`, and a rule may only filter on `detail` fields its contract actually declares.
+Every example in this README is checked against the published contracts on that basis.
+
+```bash
+pip install -r tests/requirements.txt
+pytest tests -q                       # the full suite
+python3 tests/lint_event_patterns.py  # pattern and contract lint on its own
+```
+
+Nothing here reads credentials or calls AWS. Contracts and examples are discovered from
+disk, so a new one is covered without being registered anywhere.
 
 ## Design principles
 
