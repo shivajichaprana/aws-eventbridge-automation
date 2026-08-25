@@ -56,6 +56,7 @@ about for one class of traffic:
 | `outputs.tf` | Bus, archive, key, and schema identifiers for downstream configuration |
 | `schemas/` | Published event contracts, one OpenAPI 3 document per event type |
 | `tests/` | Offline checks over every event pattern and contract in the tree |
+| `.github/workflows/ci.yml` | Terraform validate and event-pattern lint on every change |
 
 ## Getting started
 
@@ -426,6 +427,9 @@ python3 tests/lint_event_patterns.py  # pattern and contract lint on its own
 
 Nothing here reads credentials or calls AWS. Contracts and examples are discovered from
 disk, so a new one is covered without being registered anywhere.
+
+Both gates run on every push and pull request, alongside `terraform fmt`, `validate` and
+`tflint`.
 
 ## Design principles
 

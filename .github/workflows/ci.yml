@@ -1,0 +1,91 @@
+name: eventbridge-ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: eventbridge-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  TERRAFORM_VERSION: 1.9.8
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  terraform-validate:
+    name: Terraform validate
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install Terraform
+        uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3.1.2
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - name: Check formatting
+        run: terraform fmt -check -diff -recursive
+
+      - name: Initialize without a backend
+        run: terraform init -backend=false -input=false
+
+      - name: Validate the configuration
+        run: terraform validate
+
+      - name: Install TFLint
+        uses: terraform-linters/setup-tflint@19a52fbac37dacb22a09518e4ef6ee234f2d4987 # v4.0.0
+        with:
+          tflint_version: v0.53.0
+
+      - name: Lint the configuration
+        run: |
+          tflint --init
+          tflint --minimum-failure-severity=error
+
+  event-pattern-lint:
+    name: Event-pattern lint
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install Python
+        uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b # v5.3.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r tests/requirements.txt
+          pip install flake8==7.1.1
+
+      - name: Lint Python for errors that would fail at import
+        run: flake8 --select=E9,F63,F7,F82 --show-source .
+
+      - name: Byte-compile every Python file
+        run: git ls-files '*.py' | xargs -r -n1 python -m py_compile
+
+      # Terraform confirms a pattern parses as JSON. This is the layer above:
+      # whether the service would accept it, and whether it would ever match.
+      - name: Lint every event pattern and contract
+        run: python tests/lint_event_patterns.py
+
+      - name: Run the pattern suite
+        run: pytest tests -q
+
+  ci-complete:
+    name: CI complete
+    runs-on: ubuntu-24.04
+    needs: [terraform-validate, event-pattern-lint]
+    steps:
+      - name: Report success
+        run: echo "All checks passed."
