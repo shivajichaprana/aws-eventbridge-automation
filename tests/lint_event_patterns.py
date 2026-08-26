@@ -33,6 +33,7 @@ STRICT_SUFFIXES = {".md"}
 
 def _sources() -> list[Path]:
     paths = sorted(REPO_ROOT.glob("*.md")) + sorted(REPO_ROOT.glob("*.tf"))
+    paths += sorted((REPO_ROOT / "docs").glob("*.md"))
     paths += sorted((REPO_ROOT / "schemas").glob("*.md"))
     return [path for path in paths if path.is_file()]
 

@@ -8,6 +8,44 @@ The design goal is that a producer publishes an event and never learns who consu
 Routing, retention, and access are declared as configuration in this repository, so adding
 a consumer is a change here rather than a change inside the producing service.
 
+## Architecture at a glance
+
+```mermaid
+flowchart LR
+    prod["Producers<br/>services, partners, queues"]
+
+    subgraph backbone["Event backbone"]
+        direction TB
+        bus["Custom buses<br/>encrypted, per trust boundary"]
+        arc["Archives<br/>retained, replayable"]
+        reg["Contracts + discovery"]
+        rul["Rules<br/>pattern-matched fan-out"]
+        pip["Pipes<br/>queue in, one destination"]
+        sch["Schedules<br/>clock-driven, no bus"]
+    end
+
+    dst["Destinations<br/>Lambda, SQS, Step Functions,<br/>buses in other accounts"]
+    dlq["Dead-letter queues"]
+
+    prod --> bus
+    prod --> pip
+    bus --> arc
+    bus --> reg
+    bus --> rul
+    pip --> bus
+    arc -.->|"replay"| bus
+    rul --> dst
+    pip --> dst
+    sch --> dst
+    rul -.->|"on failure"| dlq
+    sch -.->|"on failure"| dlq
+```
+
+Four surfaces share a bus and nothing else. Rules and pipes both move events but fan in
+opposite directions; schedules touch no bus on the way in; cross-account delivery is an
+ordinary rule whose target happens to be somewhere else.
+[docs/architecture.md](docs/architecture.md) works through each one.
+
 ## Capabilities
 
 | Capability | What it gives you |
@@ -36,10 +74,15 @@ given a narrow resource policy. Splitting traffic across purpose-built buses mea
 access grant, an archive retention period, and a failure blast radius can each be reasoned
 about for one class of traffic:
 
-- **core** — domain events published by first-party services. Trusted producers, shorter
-  retention, schema discovery on so drift is visible.
-- **integration** — traffic exchanged with partners and vendors. Untrusted producers,
-  longer retention because disputes surface late, and a narrower set of consumers.
+| Bus | Producers | Retention | Discovery | Access |
+|---|---|---|---|---|
+| `core` | First-party services | Shorter — incidents surface fast | On, so undeclared traffic is visible | Same account only |
+| `integration` | Partners and vendors | Longer — disputes surface late | On, since a partner's output is not yours to declare | A narrowed inbound resource policy |
+
+Two is a starting point, not a rule. The question that adds a bus is whether some traffic
+needs a different retention window, a different set of people allowed to publish, or a
+failure that must not touch anything else. If none of those differ, another bus buys
+nothing.
 
 ## Repository layout
 
@@ -56,6 +99,8 @@ about for one class of traffic:
 | `outputs.tf` | Bus, archive, key, and schema identifiers for downstream configuration |
 | `schemas/` | Published event contracts, one OpenAPI 3 document per event type |
 | `tests/` | Offline checks over every event pattern and contract in the tree |
+| `docs/` | Architecture walkthrough and the guide to writing event contracts |
+| `Makefile` | Entry points for validating, deploying, and replaying |
 | `.github/workflows/ci.yml` | Terraform validate and event-pattern lint on every change |
 
 ## Getting started
@@ -92,6 +137,25 @@ module "event_backbone" {
 
 Every value above is a placeholder. Nothing in this repository is applied against an
 account by the repository itself; it ships as templates for you to plan and review.
+
+```bash
+make            # what every target does
+make ci         # every gate the pipeline runs, in pipeline order
+make plan       # what would change
+make deploy     # apply it
+```
+
+Once it is deployed, two targets answer the questions that come up most:
+
+```bash
+make undelivered                 # routes and schedules with nowhere to send a failure
+make replay BUS=platform-core \
+     FROM=2026-01-01T00:00:00Z \
+     TO=2026-01-02T00:00:00Z     # re-deliver an archived window onto its bus
+```
+
+Replay re-delivers to the bus, so every rule on it fires again. Narrow the window, and
+check what is subscribed before starting one.
 
 ## Routing
 
@@ -404,7 +468,13 @@ name is derived from those two markers rather than from the filename, so renamin
 cannot silently detach a contract from the events it describes.
 
 Adding a contract means adding a file. Discovery stays enabled alongside it so that an
-event flowing without a published contract is visible rather than invisible.
+event flowing without a published contract is visible rather than invisible — discovery
+describes what happened, a contract is an agreement, and the gap between them is the
+signal worth having.
+
+[docs/schema-guide.md](docs/schema-guide.md) covers the document format, the three rules
+enforced before publication, how a schema gets its name, the compatibility table for
+evolving a contract, and how consumers generate pinned bindings from the registry.
 
 ## Validation
 
@@ -421,15 +491,25 @@ Every example in this README is checked against the published contracts on that 
 
 ```bash
 pip install -r tests/requirements.txt
-pytest tests -q                       # the full suite
-python3 tests/lint_event_patterns.py  # pattern and contract lint on its own
+make test       # the full suite, with the same flags the pipeline uses
+make patterns   # pattern and contract lint on its own
+make ci         # the suite plus fmt, validate, and tflint
 ```
 
 Nothing here reads credentials or calls AWS. Contracts and examples are discovered from
 disk, so a new one is covered without being registered anywhere.
 
-Both gates run on every push and pull request, alongside `terraform fmt`, `validate` and
-`tflint`.
+Every gate above runs on each push and pull request. `make ci` runs the same commands with
+the same flags, so a clean run locally means a clean pipeline.
+
+## Documentation
+
+| Document | What it covers |
+|---|---|
+| [docs/architecture.md](docs/architecture.md) | Component model, the five surfaces, and the decisions behind them |
+| [docs/schema-guide.md](docs/schema-guide.md) | Writing, naming, evolving, and consuming event contracts |
+| [schemas/README.md](schemas/README.md) | Conventions for the contract files themselves |
+| [tests/README.md](tests/README.md) | What the offline suite enforces, and what it deliberately does not |
 
 ## Design principles
 
